@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推飞书。
+"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推钉钉。
 
 设计要点：
   1. 一次运行把签到与派猫都做掉；
@@ -292,57 +292,69 @@ def run_buddy(headers, endpoint):
         return {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e), "notes": notes}
 
 
-# ---------------------------------------------------------------- 飞书
+# ---------------------------------------------------------------- 钉钉
 
-def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
-    """推送到飞书自定义机器人。返回 (ok, reason)。
+def dingtalk_sign(secret):
+    """按钉钉加签规则生成 timestamp / sign：HmacSHA256 → Base64 → urlEncode。"""
+    import base64
+    import hashlib
+    import hmac
+    import urllib.parse
+    timestamp = str(round(time.time() * 1000))
+    string_to_sign = timestamp + "\n" + secret
+    code = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"),
+                    digestmod=hashlib.sha256).digest()
+    sign = urllib.parse.quote_plus(base64.b64encode(code).decode("utf-8"))
+    return timestamp, sign
 
-    重试策略与业务请求、WPS 版保持一致：
-      - 网络异常 / HTTP 5xx → 自动重试（最多 MAX_RETRY 次，退避），瞬时故障自愈
-      - 飞书业务拒绝（19001 地址无效、机器人开启签名校验等）→ 不重试（重试无用），
-        原因带改法返回，写入结果供 step summary 展示
-    兜底：脚本幂等，当天 cron 有多个时段时，下一次运行会自动再推一遍当天结果。
+
+def push_dingtalk(webhook, title, checkin_line, buddy_line, overall_ok,
+                  secret="", keyword="Buddy"):
+    """推送到钉钉自定义机器人（markdown 消息）。返回 (ok, reason)。
+
+    安全设置：默认「自定义关键词」，关键词固定出现在标题与正文中；
+    若提供 secret（加签密钥），自动把 timestamp / sign 拼到 Webhook URL 上。
+    重试策略与业务请求一致：网络异常 / HTTP 5xx 自动重试（最多 MAX_RETRY 次，退避）；
+    钉钉业务拒绝（errcode != 0）不重试，重试无用，原因直接带改法返回。
     """
-    color = "green" if overall_ok else "red"
-    lines = [
-        "**%s**" % title,
-        "",
-        "**签到**",
-        checkin_line,
-        "",
-        "**猫猫旅行**",
-        buddy_line,
-    ]
+    head = "## Buddy 加油站 · %s" % ("签到成功" if overall_ok else "签到未达成")
+    lines = [head, "", "**签到**", checkin_line, "", "**猫猫旅行**", buddy_line]
+    text = "\n".join(lines)
+    # 关键词兜底：即便将来改了文案，也保证命中机器人的自定义关键词
+    if keyword and keyword not in text:
+        text += "\n\n" + keyword
     payload = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "template": color,
-                "title": {"tag": "plain_text",
-                          "content": "Buddy 加油站 · %s" % ("成功" if overall_ok else "部分失败")},
-            },
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}],
-        },
+        "msgtype": "markdown",
+        "markdown": {"title": "Buddy 加油站 · %s" % title, "text": text},
     }
-    data = json.dumps(payload).encode("utf-8")
+    url = webhook
+    if secret:
+        timestamp, sign = dingtalk_sign(secret)
+        sep = "&" if "?" in url else "?"
+        url = "%s%stimestamp=%s&sign=%s" % (url, sep, timestamp, sign)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     attempt = 0
     while True:
         attempt += 1
         try:
-            req = urllib.request.Request(webhook, data=data, method="POST",
-                                         headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(url, data=data, method="POST",
+                                         headers={"Content-Type": "application/json; charset=utf-8"})
             with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
                 body = json.loads(resp.read().decode("utf-8", "replace"))
-                log("  [飞书] HTTP %s %s" % (resp.status, json.dumps(body, ensure_ascii=False)))
-                if body.get("code") == 0:
+                log("  [钉钉] HTTP %s %s" % (resp.status, json.dumps(masked(body), ensure_ascii=False)))
+                code = body.get("errcode", body.get("code", "未知"))
+                if code == 0:
                     return True, ""
-                return False, ("飞书返回码 %s（19001 多为地址不对；机器人若开了签名校验也会失败。"
-                               "这是配置问题，重试无用：检查 Secret FEISHU_WEBHOOK，或建机器人时"
-                               "不要勾选签名校验）" % body.get("code", "未知"))
+                hint = {
+                    310000: "安全校验没过：核对机器人关键词（默认 Buddy，可用 DINGTALK_KEYWORD 改）、"
+                            "加签密钥 Secret DINGTALK_SECRET，并关掉 IP 地址段（GitHub 出口 IP 不固定）",
+                    410100: "触发限流（每机器人每分钟 20 条），等 10 分钟再跑；本脚本一天只发几条",
+                }.get(code, "检查 Secret DINGTALK_WEBHOOK 是否完整复制了 Webhook 地址")
+                return False, "钉钉 errcode %s（%s）。这是配置问题，重试无用：%s" % (
+                    code, body.get("errmsg", ""), hint)
         except urllib.error.HTTPError as e:
             if e.code >= 500 and attempt < MAX_RETRY:
-                log("  [飞书] HTTP %s，退避后重试（%d/%d）" % (e.code, attempt, MAX_RETRY))
+                log("  [钉钉] HTTP %s，退避后重试（%d/%d）" % (e.code, attempt, MAX_RETRY))
                 time.sleep(2.0 * attempt)
                 continue
             if e.code >= 500:
@@ -350,7 +362,7 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
             return False, "HTTP %s" % e.code
         except Exception as e:
             if attempt < MAX_RETRY:
-                log("  [飞书] 请求异常，退避后重试（%d/%d）：%s: %s"
+                log("  [钉钉] 请求异常，退避后重试（%d/%d）：%s: %s"
                     % (attempt, MAX_RETRY, type(e).__name__, e))
                 time.sleep(2.0 * attempt)
                 continue
@@ -361,14 +373,17 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
 
 def main():
     token = os.environ.get("WB_ACCESS_TOKEN")
-    webhook = os.environ.get("FEISHU_WEBHOOK")
+    webhook = (os.environ.get("DINGTALK_WEBHOOK")
+               or os.environ.get("FEISHU_WEBHOOK"))  # 兼容旧 Secret 名
+    ding_secret = os.environ.get("DINGTALK_SECRET") or ""
+    ding_keyword = os.environ.get("DINGTALK_KEYWORD") or "Buddy"
     endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
 
     if not token:
         log("缺少环境变量 WB_ACCESS_TOKEN（请在本机运行 refresh_token.py 注入 GitHub Secret）")
         return 2
     if not webhook:
-        log("缺少环境变量 FEISHU_WEBHOOK")
+        log("缺少环境变量 DINGTALK_WEBHOOK（兼容旧名 FEISHU_WEBHOOK）")
 
     headers = {
         "Accept": "application/json",
@@ -395,9 +410,10 @@ def main():
     buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
 
     # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论
-    push_ok, push_reason = None, "未配置（缺少 FEISHU_WEBHOOK，本次不推送）"
+    push_ok, push_reason = None, "未配置（缺少 DINGTALK_WEBHOOK，本次不推送）"
     if webhook:
-        push_ok, push_reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
+        push_ok, push_reason = push_dingtalk(webhook, "每日自动化", checkin_line,
+                                          buddy_line, overall_ok, ding_secret, ding_keyword)
 
     result = {
         "checkin": {"ok": checkin_ok, **checkin},
@@ -411,13 +427,13 @@ def main():
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
-            push_line = ("✅ 已推送到飞书" if push_ok
+            push_line = ("✅ 已推送到钉钉" if push_ok
                          else "❌ 推送失败：%s" % push_reason)
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
                 f.write("| 签到 | %s |\n" % checkin_line)
                 f.write("| 猫猫旅行 | %s |\n" % buddy_line)
-                f.write("| 飞书推送 | %s |\n" % push_line)
+                f.write("| 钉钉推送 | %s |\n" % push_line)
                 f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok else "失败（签到未达成）"))
         except OSError as e:
             log("结果文件写入失败：%s" % e)
